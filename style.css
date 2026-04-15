@@ -1,0 +1,54 @@
+/* SimpleDiscordCrypt styles */
+
+.sdc-lock-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.1s, opacity 0.15s;
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 20px;
+    padding: 0 4px;
+}
+
+.sdc-lock-btn:hover {
+    transform: scale(1.15);
+}
+
+.sdc-lock-active {
+    opacity: 1;
+}
+
+.sdc-lock-inactive {
+    opacity: 0.45;
+    filter: grayscale(0.6);
+}
+
+.sdc-header-controls {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-right: 8px;
+    position: relative;
+    z-index: 10001;
+}
+
+.sdc-key-selector-wrap {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+}
+
+/* Key manager table type badges */
+.sdc-key-type-dm { background: #5865f2; }
+.sdc-key-type-group { background: #3ba55c; }
+.sdc-key-type-personal { background: #747f8d; }
+
+/* Fallback for unrevealed braille if needed */
+.sdc-braille-raw {
+    font-family: monospace;
+    font-size: 10px;
+    opacity: 0.4;
+    cursor: help;
+}
