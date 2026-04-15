@@ -92,9 +92,24 @@ async function tryDecrypt(messageId: string, content: string, channelId: string)
     if (cached) return cached;
 
     if (!content.startsWith(SDC_PREFIX) || !content.endsWith(SDC_SUFFIX)) return null;
-    if (!isUnlocked()) return null;
+    
+    if (!isUnlocked()) {
+        return { plaintext: "[Locked - Unlock SDC to decrypt]", success: false, timestamp: Date.now() };
+    }
 
     const rawBraille = content.slice(SDC_PREFIX.length, -SDC_SUFFIX.length);
+    
+    // Validate braille format
+    if (!isBrailleMessage(rawBraille)) {
+        const failure: DecryptedMessage = { 
+            plaintext: "Invalid message format", 
+            success: false, 
+            timestamp: Date.now() 
+        };
+        decryptCache.set(messageId, failure);
+        return failure;
+    }
+    
     const keysToTry = listKeys(true);
     const keyId = getActiveKeyIdForChannel(channelId);
     
@@ -109,21 +124,27 @@ async function tryDecrypt(messageId: string, content: string, channelId: string)
 
         try {
             const plaintext = await decryptMessage(rawBraille, aesKey);
-            if (plaintext !== null) {
+            if (plaintext !== null && plaintext.length > 0) {
                 const result: DecryptedMessage = {
                     plaintext,
                     success: true,
                     timestamp: Date.now(),
                 };
                 decryptCache.set(messageId, result);
+                logger.debug(`✓ Decrypted with key: ${key.name}`);
                 return result;
             }
-        } catch {
+        } catch (err) {
+            logger.debug(`Failed with key ${key.name}:`, err);
             continue;
         }
     }
 
-    const failure: DecryptedMessage = { plaintext: "", success: false, timestamp: Date.now() };
+    const failure: DecryptedMessage = { 
+        plaintext: `Wrong key (tried ${sortedKeys.length} key${sortedKeys.length !== 1 ? 's' : ''})`, 
+        success: false, 
+        timestamp: Date.now() 
+    };
     decryptCache.set(messageId, failure);
     return failure;
 }
@@ -152,7 +173,7 @@ function reprocessAllMessages() {
         const hasProtocol = m.content && m.content.startsWith(SDC_PREFIX) && m.content.endsWith(SDC_SUFFIX);
         const hasEncAttachments = m.attachments?.some((a: any) => a.filename.endsWith(".enc") && !a._decrypted);
         
-        if ((hasProtocol && !m.content.startsWith("🔐 ")) || hasEncAttachments) {
+        if ((hasProtocol && !m.content.startsWith("🔐 ") && !m.content.startsWith("🔒 ")) || hasEncAttachments) {
             processIncomingMessage(m);
             if (m.attachments?.length > 0) decryptAttachments(m);
         }
@@ -162,8 +183,16 @@ function reprocessAllMessages() {
 function processIncomingMessage(message: any) {
     if (!message || typeof message.content !== "string") return;
     if (!message.content.startsWith(SDC_PREFIX) || !message.content.endsWith(SDC_SUFFIX)) return;
-    if (!isUnlocked()) return;
-    if (message.content.startsWith("🔐 ")) return;
+    
+    if (!isUnlocked()) {
+        // Mark as encrypted but locked
+        if (!message.content.startsWith("🔒 ")) {
+            message.content = "🔒 [Locked - Unlock SDC to decrypt]";
+        }
+        return;
+    }
+    
+    if (message.content.startsWith("🔐 ") || message.content.startsWith("🔒 ")) return; // Already processed
 
     const channelId = message.channel_id || message.channelId;
     if (!channelId) return;
@@ -174,7 +203,11 @@ function processIncomingMessage(message: any) {
         return;
     }
 
-    tryDecrypt(message.id, message.content, channelId).then(dec => {
+    // Show decrypting placeholder
+    const originalContent = message.content;
+    message.content = "🔐 [Decrypting...]";
+
+    tryDecrypt(message.id, originalContent, channelId).then(dec => {
         if (dec?.success && dec.plaintext) {
             const finalPlain = `🔐 ${dec.plaintext}`;
             message.content = finalPlain;
@@ -186,7 +219,21 @@ function processIncomingMessage(message: any) {
                     FluxDispatcher.dispatch({ type: "MESSAGE_UPDATE", message: msgInStore, _sdc: true });
                 }
             }
+        } else {
+            // Decryption failed
+            message.content = `🔐 ❌ [${dec?.plaintext || "Decryption failed"}]`;
+            
+            if (MessageStore && FluxDispatcher) {
+                const msgInStore = MessageStore.getMessage(channelId, message.id);
+                if (msgInStore) {
+                    msgInStore.content = message.content;
+                    FluxDispatcher.dispatch({ type: "MESSAGE_UPDATE", message: msgInStore, _sdc: true });
+                }
+            }
         }
+    }).catch(err => {
+        logger.error("Decryption error:", err);
+        message.content = "🔐 ⚠️ [Error during decryption]";
     });
 }
 
@@ -236,27 +283,48 @@ function sdcFluxInterceptor(action: any) {
 
     switch (action.type) {
         case "MESSAGE_CREATE":
+            if (action.message) {
+                Promise.resolve().then(() => {
             processIncomingMessage(action.message);
-            if (action.message.attachments?.length > 0) decryptAttachments(action.message);
+                    if (action.message.attachments?.length > 0) {
+                        decryptAttachments(action.message);
+                    }
+                });
+            }
             break;
+            
         case "MESSAGE_UPDATE":
-            if (action.message.content && action.message.content.startsWith(SDC_PREFIX)) {
+            if (action.message) {
+                if (action.message.content?.startsWith(SDC_PREFIX)) {
                 decryptCache.delete(action.message.id);
             }
+                Promise.resolve().then(() => {
             processIncomingMessage(action.message);
-            if (action.message.attachments?.length > 0) decryptAttachments(action.message);
-            break;
-        case "LOAD_MESSAGES_SUCCESS":
-            if (Array.isArray(action.messages)) {
-                for (const m of action.messages) {
-                    processIncomingMessage(m);
-                    if (m.attachments?.length > 0) decryptAttachments(m);
-                }
+                    if (action.message.attachments?.length > 0) {
+                        decryptAttachments(action.message);
+                    }
+                });
             }
             break;
+            
+        case "LOAD_MESSAGES_SUCCESS":
+            if (Array.isArray(action.messages)) {
+                Promise.resolve().then(() => {
+                for (const m of action.messages) {
+                    processIncomingMessage(m);
+                        if (m.attachments?.length > 0) {
+                            decryptAttachments(m);
+                        }
+                }
+                });
+            }
+            break;
+            
         case "CHANNEL_SELECT":
         case "GUILD_SELECT":
-            setTimeout(reprocessAllMessages, 100);
+            setTimeout(() => {
+                reprocessAllMessages();
+            }, 150);
             break;
     }
 }
@@ -297,6 +365,10 @@ function SdcHeaderBarControls() {
     const channel = ChannelStore.getChannel(channelId);
     if (!channel) return null;
 
+    const enabled = isEncryptionEnabled(channelId);
+    const activeKeyId = getActiveKeyIdForChannel(channelId);
+    const activeKey = activeKeyId ? getKey(activeKeyId) : null;
+
     const handleContextMenu = (e: React.MouseEvent) => {
         e.preventDefault();
         e.stopPropagation();
@@ -313,7 +385,12 @@ function SdcHeaderBarControls() {
     return (
         <div className="sdc-header-controls" style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}>
             <LockButton channelId={channelId} onToggle={() => forceUpdate()} onContextMenu={handleContextMenu} />
-            <KeySelector channelId={channelId} />
+            <KeySelector channelId={channelId} onUpdate={() => forceUpdate()} />
+            {enabled && !activeKey && (
+                <span style={{ color: "var(--status-warning)", fontSize: "11px", fontWeight: 500 }}>
+                    ⚠️ No key
+                </span>
+            )}
         </div>
     );
 }
@@ -382,21 +459,86 @@ export default definePlugin({
                 replace: "$1window.SdcToolbarControls?.(),"
             }
         },
-        {
-            find: 'isSearchHit:"',
-            replacement: {
-                match: /constructor\((.*?)\)\{/,
-                replace: "constructor($1){ window.SdcProcessMsg?.(this);"
-            }
-        },
     ],
 
     async start() {
-        // DEFENSIVE WEBPACK RESOLUTION
-        try { MessageStore = findByProps("getMessage", "getMessages"); } catch (e) { logger.warn("MessageStore not found yet"); }
-        try { FluxDispatcher = findByProps("dispatch", "subscribe") || (Flux as any).Dispatcher; } catch (e) { logger.warn("FluxDispatcher not found yet"); }
+        // IMPROVED WEBPACK RESOLUTION WITH RETRY
+        const resolveModules = async () => {
+            let attempts = 0;
+            const maxAttempts = 10;
+            
+            while (attempts < maxAttempts) {
+                try {
+                    if (!MessageStore) {
+                        MessageStore = findByProps("getMessage", "getMessages");
+                        logger.info("✓ MessageStore resolved");
+                    }
+                    if (!FluxDispatcher) {
+                        FluxDispatcher = findByProps("dispatch", "subscribe") || (Flux as any).Dispatcher;
+                        logger.info("✓ FluxDispatcher resolved");
+                    }
+                    
+                    if (MessageStore && FluxDispatcher) {
+                        break;
+                    }
+                } catch (e) {
+                    logger.warn(`Module resolution attempt ${attempts + 1}/${maxAttempts}`);
+                }
+                
+                attempts++;
+                await new Promise(resolve => setTimeout(resolve, Math.min(100 * Math.pow(2, attempts), 2000)));
+            }
+            
+            if (!MessageStore || !FluxDispatcher) {
+                logger.error("❌ Failed to resolve required modules");
+            }
+        };
 
-        if (FluxDispatcher) FluxDispatcher.addInterceptor(sdcFluxInterceptor);
+        await resolveModules();
+        
+        if (FluxDispatcher) {
+            FluxDispatcher.addInterceptor(sdcFluxInterceptor);
+            logger.info("✓ Flux interceptor added");
+        }
+
+        // FILE UPLOAD HOOK
+        try {
+            const UploadModule = findByProps("instantBatchUpload", "upload");
+            if (UploadModule && UploadModule.instantBatchUpload) {
+                (this as any)._originalInstantBatchUpload = UploadModule.instantBatchUpload;
+                
+                UploadModule.instantBatchUpload = async (channelId: string, files: File[], ...args: any[]) => {
+                    if (!isUnlocked() || !isEncryptionEnabled(channelId)) {
+                        return (this as any)._originalInstantBatchUpload.call(UploadModule, channelId, files, ...args);
+                    }
+                    
+                    const keyId = getActiveKeyIdForChannel(channelId);
+                    if (!keyId) {
+                        logger.warn("No key selected for channel", channelId);
+                        return (this as any)._originalInstantBatchUpload.call(UploadModule, channelId, files, ...args);
+                    }
+                    
+                    const aesKey = await getAesKeyForId(keyId, channelId);
+                    if (!aesKey) {
+                        logger.error("Failed to get AES key for file encryption");
+                        return (this as any)._originalInstantBatchUpload.call(UploadModule, channelId, files, ...args);
+                    }
+                    
+                    logger.info(`🔐 Encrypting ${files.length} file(s)`);
+                    const encryptedFiles = await Promise.all(
+                        files.map(f => encryptFile(f, aesKey))
+                    );
+                    
+                    return (this as any)._originalInstantBatchUpload.call(UploadModule, channelId, encryptedFiles, ...args);
+                };
+                
+                logger.info("✓ File upload hook installed");
+            } else {
+                logger.warn("⚠️ Upload module not found - file encryption disabled");
+            }
+        } catch (e) {
+            logger.error("❌ Failed to hook file uploads:", e);
+        }
 
         (window as any).SdcToolbarControls = SdcHeaderBarControls;
         (window as any).SdcProcessMsg = processIncomingMessage;
@@ -407,11 +549,25 @@ export default definePlugin({
         (window as any).SdcGetAesKey = getAesKeyForId;
         (window as any).SdcEncryptFile = encryptFile;
 
+        // Debug tools
+        (window as any).SdcDebug = {
+            cache: () => decryptCache,
+            clearCache: () => decryptCache.clear(),
+            reprocess: () => reprocessAllMessages(),
+            testEncrypt: async (text: string) => {
+                const ch = (ChannelStore as any).getChannelId();
+                const keyId = getActiveKeyIdForChannel(ch);
+                const aesKey = keyId ? await getAesKeyForId(keyId, ch) : null;
+                if (!aesKey) return "No key";
+                return await encryptMessage(text, aesKey);
+            }
+        };
+
         addMessagePreSendListener(preSendListener);
 
         setTimeout(() => {
             openStartupModal(() => {
-                logger.info("SDC Ready");
+                logger.info("✅ SDC Ready");
                 reprocessAllMessages();
             });
         }, 1000);
@@ -431,6 +587,7 @@ export default definePlugin({
         } catch (e) {}
 
         delete (window as any).SdcToolbarControls;
+        delete (window as any).SdcDebug;
         removeMessagePreSendListener(preSendListener);
     },
 });
